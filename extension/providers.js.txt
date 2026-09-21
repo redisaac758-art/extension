@@ -1,0 +1,241 @@
+// Provider catalog for the Models tab.
+//
+// `format` is the wire protocol:
+//   'openai'    -> POST {baseUrl}/chat/completions   (works with hundreds of hosts)
+//   'anthropic' -> POST {baseUrl}/messages           (Anthropic native)
+//
+// Free-tier numbers change often. They are shown as hints only; the real limit is
+// whatever the provider answers with, and every model has its own "requests per
+// minute" setting that the extension enforces client-side to avoid 429s.
+//
+// `suggested` models are starting points. Use "Fetch models" in the Models tab to
+// see what a provider actually serves today.
+
+export const PROVIDERS = [
+  {
+    id: 'openrouter',
+    name: 'OpenRouter',
+    group: 'free',
+    format: 'openai',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    keyUrl: 'https://openrouter.ai/settings/keys',
+    needsKey: true,
+    rpm: 15,
+    freeNote:
+      'Models tagged :free cost nothing, about 20 requests/min and 50/day (1,000/day after a one-time $10 top-up). ' +
+      '"openrouter/free" picks a free model that supports images for you. Free providers may log prompts.',
+    listing: 'openrouter',
+    suggested: [
+      { model: 'openrouter/free', label: 'Free router (auto-picks a free model)', vision: true },
+    ],
+    headers: { 'X-Title': 'Game Agent' },
+  },
+  {
+    id: 'gemini',
+    name: 'Google Gemini (AI Studio)',
+    group: 'free',
+    format: 'openai',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    keyUrl: 'https://aistudio.google.com/apikey',
+    needsKey: true,
+    rpm: 10,
+    freeNote:
+      'Free tier covers Flash and Flash-Lite models with no card. Best free option for screenshots (vision). ' +
+      'Google may use free-tier prompts to improve its products, so avoid private pages.',
+    listing: 'openai',
+    stripPrefix: 'models/',
+    suggested: [
+      { model: 'gemini-2.5-flash-lite', label: 'Gemini 2.5 Flash-Lite', vision: true },
+      { model: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', vision: true },
+    ],
+  },
+  {
+    id: 'groq',
+    name: 'Groq',
+    group: 'free',
+    format: 'openai',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    keyUrl: 'https://console.groq.com/keys',
+    needsKey: true,
+    rpm: 25,
+    freeNote:
+      'Very fast, no card. Roughly 30 requests/min and about 1,000/day on the free plan. Speed matters for real-time games.',
+    listing: 'openai',
+    suggested: [
+      { model: 'meta-llama/llama-4-scout-17b-16e-instruct', label: 'Llama 4 Scout (vision)', vision: true },
+      { model: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B (text only)', vision: false },
+    ],
+  },
+  {
+    id: 'cerebras',
+    name: 'Cerebras',
+    group: 'free',
+    format: 'openai',
+    baseUrl: 'https://api.cerebras.ai/v1',
+    keyUrl: 'https://cloud.cerebras.ai/',
+    needsKey: true,
+    rpm: 25,
+    freeNote: 'Free tier with a daily token allowance (around 1M tokens/day). Extremely fast, text models.',
+    listing: 'openai',
+    suggested: [],
+  },
+  {
+    id: 'mistral',
+    name: 'Mistral (La Plateforme)',
+    group: 'free',
+    format: 'openai',
+    baseUrl: 'https://api.mistral.ai/v1',
+    keyUrl: 'https://console.mistral.ai/api-keys',
+    needsKey: true,
+    rpm: 20,
+    freeNote: 'Free "Experiment" tier with generous monthly tokens. Free-tier data may be used for training.',
+    listing: 'openai',
+    suggested: [{ model: 'mistral-small-latest', label: 'Mistral Small (vision)', vision: true }],
+  },
+  {
+    id: 'cloudflare',
+    name: 'Cloudflare Workers AI',
+    group: 'free',
+    format: 'openai',
+    baseUrl: 'https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1',
+    keyUrl: 'https://dash.cloudflare.com/profile/api-tokens',
+    needsKey: true,
+    rpm: 20,
+    freeNote:
+      'About 10,000 free "neurons" per day. Replace YOUR_ACCOUNT_ID in the base URL with your Cloudflare account ID.',
+    listing: 'none',
+    suggested: [
+      { model: '@cf/meta/llama-3.2-11b-vision-instruct', label: 'Llama 3.2 11B Vision', vision: true },
+    ],
+  },
+  {
+    id: 'nvidia',
+    name: 'NVIDIA NIM',
+    group: 'free',
+    format: 'openai',
+    baseUrl: 'https://integrate.api.nvidia.com/v1',
+    keyUrl: 'https://build.nvidia.com/',
+    needsKey: true,
+    rpm: 30,
+    freeNote:
+      'Free developer credits for many open models (about 1,000 requests/day reported). Intended for development and testing, not commercial use.',
+    listing: 'openai',
+    suggested: [],
+  },
+  {
+    id: 'ollama',
+    name: 'Ollama (runs on your PC)',
+    group: 'local',
+    format: 'openai',
+    baseUrl: 'http://localhost:11434/v1',
+    keyUrl: 'https://ollama.com/download',
+    needsKey: false,
+    rpm: 0,
+    freeNote:
+      'Completely free and private, no rate limits. Chrome extensions are blocked by default: set the environment variable ' +
+      'OLLAMA_ORIGINS=chrome-extension://* and restart Ollama. For vision try "ollama pull qwen2.5vl:7b" or "gemma3:4b".',
+    listing: 'openai',
+    suggested: [
+      { model: 'qwen2.5vl:7b', label: 'Qwen2.5-VL 7B (vision)', vision: true },
+      { model: 'gemma3:4b', label: 'Gemma 3 4B (vision)', vision: true },
+    ],
+  },
+  {
+    id: 'lmstudio',
+    name: 'LM Studio (runs on your PC)',
+    group: 'local',
+    format: 'openai',
+    baseUrl: 'http://localhost:1234/v1',
+    keyUrl: 'https://lmstudio.ai/',
+    needsKey: false,
+    rpm: 0,
+    freeNote: 'Free and private. Start the local server in LM Studio and turn on "Enable CORS".',
+    listing: 'openai',
+    suggested: [],
+  },
+  {
+    id: 'openai',
+    name: 'OpenAI',
+    group: 'paid',
+    format: 'openai',
+    baseUrl: 'https://api.openai.com/v1',
+    keyUrl: 'https://platform.openai.com/api-keys',
+    needsKey: true,
+    rpm: 0,
+    freeNote: 'Paid. Bring your own key.',
+    listing: 'openai',
+    suggested: [],
+  },
+  {
+    id: 'anthropic',
+    name: 'Anthropic (native API)',
+    group: 'paid',
+    format: 'anthropic',
+    baseUrl: 'https://api.anthropic.com/v1',
+    keyUrl: 'https://console.anthropic.com/settings/keys',
+    needsKey: true,
+    rpm: 0,
+    freeNote: 'Paid. Bring your own key. Uses the native Messages API.',
+    listing: 'anthropic',
+    suggested: [],
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    group: 'paid',
+    format: 'openai',
+    baseUrl: 'https://api.deepseek.com/v1',
+    keyUrl: 'https://platform.deepseek.com/api_keys',
+    needsKey: true,
+    rpm: 0,
+    freeNote: 'Paid (very cheap), text only. Good with Element-list mode for menu-driven games.',
+    listing: 'openai',
+    suggested: [],
+  },
+  {
+    id: 'custom',
+    name: 'Custom endpoint',
+    group: 'custom',
+    format: 'openai',
+    baseUrl: '',
+    keyUrl: '',
+    needsKey: false,
+    rpm: 0,
+    freeNote:
+      'Any server that speaks the OpenAI chat-completions format (vLLM, llama.cpp, LiteLLM, your own proxy, a hosted fine-tune...). ' +
+      'Switch the format to Anthropic if your endpoint uses the Messages API.',
+    listing: 'openai',
+    suggested: [],
+  },
+];
+
+export const providerById = (id) => PROVIDERS.find((p) => p.id === id) || PROVIDERS[PROVIDERS.length - 1];
+
+export const GROUP_LABELS = {
+  free: 'Free hosted models',
+  local: 'Run on your PC',
+  paid: 'Bring your own key',
+  custom: 'Custom',
+};
+
+/** Blank model config seeded from a provider. */
+export function newModelFromProvider(providerId) {
+  const p = providerById(providerId);
+  const first = p.suggested[0];
+  return {
+    id: null,
+    name: p.id === 'custom' ? 'My model' : p.name.replace(/ \(.*\)$/, ''),
+    providerId: p.id,
+    format: p.format,
+    baseUrl: p.baseUrl,
+    apiKey: '',
+    model: first?.model || '',
+    vision: first?.vision ?? false,
+    rpm: p.rpm,
+    temperature: 0.3,
+    maxTokens: 900,
+    headers: p.headers ? { ...p.headers } : {},
+    extraBody: {},
+    free: p.group === 'free' || p.group === 'local',
+  };
+}

@@ -1,0 +1,117 @@
+import { uid } from './util.js';
+
+export const DEFAULT_SETTINGS = {
+  theme: 'auto', // auto | dark | light
+  mode: 'assist', // observe | assist | auto
+  maxSteps: 40,
+  stepDelayMs: 350,
+  actionsPerStep: 5,
+  shotWidth: 960,
+  jpegQuality: 60,
+  sendScreenshots: true,
+  sendPrevFrame: false,
+  includeDom: true,
+  allowEval: false,
+  focusEmulation: true,
+  showBadge: true,
+  activeModelId: null,
+  approvedHosts: [],
+  historyLimit: 60,
+  promptHistory: 6,
+  autoSync: false,
+};
+
+async function read(key, fallback) {
+  const out = await chrome.storage.local.get(key);
+  return out[key] === undefined ? fallback : out[key];
+}
+const write = (key, value) => chrome.storage.local.set({ [key]: value });
+
+// ---- settings ---------------------------------------------------------------
+export async function getSettings() {
+  return { ...DEFAULT_SETTINGS, ...(await read('settings', {})) };
+}
+export async function saveSettings(patch) {
+  const next = { ...(await getSettings()), ...patch };
+  await write('settings', next);
+  return next;
+}
+
+// ---- models -----------------------------------------------------------------
+export const getModels = () => read('models', []);
+export async function upsertModel(model) {
+  const models = await getModels();
+  const m = { ...model, id: model.id || uid('mdl') };
+  const i = models.findIndex((x) => x.id === m.id);
+  if (i >= 0) models[i] = m;
+  else models.push(m);
+  await write('models', models);
+  const s = await getSettings();
+  if (!s.activeModelId) await saveSettings({ activeModelId: m.id });
+  return m;
+}
+export async function removeModel(id) {
+  const models = (await getModels()).filter((m) => m.id !== id);
+  await write('models', models);
+  const s = await getSettings();
+  if (s.activeModelId === id) await saveSettings({ activeModelId: models[0]?.id ?? null });
+}
+export const replaceModels = (models) => write('models', models);
+export async function getActiveModel() {
+  const [models, s] = await Promise.all([getModels(), getSettings()]);
+  return models.find((m) => m.id === s.activeModelId) || models[0] || null;
+}
+
+// ---- presets ----------------------------------------------------------------
+export const getPresets = () => read('presets', []);
+export async function upsertPreset(p) {
+  const presets = await getPresets();
+  const next = { ...p, id: p.id || uid('pre'), updatedAt: Date.now() };
+  const i = presets.findIndex((x) => x.id === next.id);
+  if (i >= 0) presets[i] = next;
+  else presets.push(next);
+  await write('presets', presets);
+  return next;
+}
+export async function removePreset(id) {
+  await write('presets', (await getPresets()).filter((p) => p.id !== id));
+}
+export const replacePresets = (presets) => write('presets', presets);
+
+// ---- watched values (per host) ----------------------------------------------
+export const getWatches = () => read('watches', {});
+export async function saveWatches(host, list) {
+  const all = await getWatches();
+  all[host] = list;
+  await write('watches', all);
+}
+
+// ---- run history ------------------------------------------------------------
+export const getHistory = () => read('history', []);
+export async function addHistory(entry) {
+  const s = await getSettings();
+  const list = await getHistory();
+  const i = list.findIndex((x) => x.id === entry.id);
+  if (i >= 0) list[i] = entry;
+  else list.unshift(entry);
+  await write('history', list.slice(0, s.historyLimit));
+}
+export async function removeHistory(id) {
+  await write('history', (await getHistory()).filter((h) => h.id !== id));
+}
+export const clearHistory = () => write('history', []);
+export const replaceHistory = (list) => write('history', list);
+
+// ---- supabase ---------------------------------------------------------------
+export const getSupabase = () => read('supabase', { url: '', anonKey: '', session: null });
+export async function saveSupabase(patch) {
+  const next = { ...(await getSupabase()), ...patch };
+  await write('supabase', next);
+  return next;
+}
+
+export function onStorageChange(cb) {
+  const fn = (changes, area) => area === 'local' && cb(changes);
+  chrome.storage.onChanged.addListener(fn);
+  return () => chrome.storage.onChanged.removeListener(fn);
+}

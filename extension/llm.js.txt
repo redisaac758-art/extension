@@ -1,0 +1,238 @@
+import { sleep, abortError } from './util.js';
+import { providerById } from './providers.js';
+
+/**
+ * Internal message format (provider independent):
+ *   { role: 'user' | 'assistant', content: string | Part[] }
+ *   Part = { type: 'text', text } | { type: 'image', mime, data /* base64 *\/ }
+ */
+
+export class LLMError extends Error {
+  constructor(message, { status = 0, retryAfter = 0, body = '' } = {}) {
+    super(message);
+    this.name = 'LLMError';
+    this.status = status;
+    this.retryAfter = retryAfter;
+    this.body = body;
+  }
+}
+
+// ---- client-side rate limiter (per model id) ------------------------------------
+const nextSlot = new Map();
+async function throttle(cfg, signal) {
+  const rpm = Number(cfg.rpm) || 0;
+  if (!rpm) return;
+  const gap = 60000 / rpm;
+  const now = Date.now();
+  const slot = Math.max(now, nextSlot.get(cfg.id) || 0);
+  nextSlot.set(cfg.id, slot + gap);
+  if (slot > now) await sleep(slot - now, signal);
+}
+
+const joinUrl = (base, path) => `${String(base).replace(/\/+$/, '')}/${String(path).replace(/^\/+/, '')}`;
+
+function headersFor(cfg) {
+  const h = { 'Content-Type': 'application/json', ...(cfg.headers || {}) };
+  if (cfg.format === 'anthropic') {
+    if (cfg.apiKey) h['x-api-key'] = cfg.apiKey;
+    h['anthropic-version'] = '2023-06-01';
+    h['anthropic-dangerous-direct-browser-access'] = 'true';
+  } else if (cfg.apiKey) {
+    h.Authorization = `Bearer ${cfg.apiKey}`;
+  }
+  return h;
+}
+
+// ---- request builders -------------------------------------------------------------
+export function buildOpenAIBody(cfg, { system, messages, maxTokens, temperature }) {
+  const out = [];
+  if (system) out.push({ role: 'system', content: system });
+  for (const m of messages) {
+    if (typeof m.content === 'string') {
+      out.push({ role: m.role, content: m.content });
+    } else {
+      out.push({
+        role: m.role,
+        content: m.content.map((p) =>
+          p.type === 'image'
+            ? { type: 'image_url', image_url: { url: `data:${p.mime || 'image/jpeg'};base64,${p.data}` } }
+            : { type: 'text', text: p.text },
+        ),
+      });
+    }
+  }
+  const tokenKey = cfg.tokenParam || 'max_tokens';
+  return {
+    model: cfg.model,
+    messages: out,
+    temperature: temperature ?? cfg.temperature ?? 0.3,
+    [tokenKey]: maxTokens ?? cfg.maxTokens ?? 900,
+    ...(cfg.extraBody || {}),
+  };
+}
+
+export function buildAnthropicBody(cfg, { system, messages, maxTokens, temperature }) {
+  return {
+    model: cfg.model,
+    max_tokens: maxTokens ?? cfg.maxTokens ?? 900,
+    temperature: temperature ?? cfg.temperature ?? 0.3,
+    ...(system ? { system } : {}),
+    messages: messages.map((m) => ({
+      role: m.role,
+      content:
+        typeof m.content === 'string'
+          ? m.content
+          : m.content.map((p) =>
+              p.type === 'image'
+                ? { type: 'image', source: { type: 'base64', media_type: p.mime || 'image/jpeg', data: p.data } }
+                : { type: 'text', text: p.text },
+            ),
+    })),
+    ...(cfg.extraBody || {}),
+  };
+}
+
+// ---- response parsers -------------------------------------------------------------
+export function parseOpenAIResponse(json) {
+  const msg = json?.choices?.[0]?.message;
+  let text = '';
+  if (typeof msg?.content === 'string') text = msg.content;
+  else if (Array.isArray(msg?.content)) text = msg.content.map((p) => p.text || '').join('');
+  return { text: text.trim(), usage: json?.usage || null, model: json?.model };
+}
+
+export function parseAnthropicResponse(json) {
+  const text = (json?.content || [])
+    .filter((p) => p.type === 'text')
+    .map((p) => p.text)
+    .join('');
+  return { text: text.trim(), usage: json?.usage || null, model: json?.model };
+}
+
+function errorMessage(status, bodyText) {
+  let detail = '';
+  try {
+    const j = JSON.parse(bodyText);
+    detail = j?.error?.message || j?.message || j?.error || '';
+    if (typeof detail !== 'string') detail = JSON.stringify(detail);
+  } catch {
+    detail = bodyText?.slice(0, 200) || '';
+  }
+  const hints = {
+    400: 'The provider rejected the request. If this model is text-only, turn off "Sees images" for it.',
+    401: 'The API key was rejected. Check the key and the base URL.',
+    403: 'Access denied. The key may lack permission, or a local server is blocking the extension (see the Ollama note).',
+    404: 'Endpoint or model not found. Check the base URL and model name.',
+    429: 'Rate limit reached. Lower "Requests per minute" for this model or wait a bit.',
+  };
+  const hint = hints[status] ? ` ${hints[status]}` : '';
+  return `HTTP ${status}${detail ? `: ${detail}` : ''}.${hint}`.trim();
+}
+
+// ---- main entry -------------------------------------------------------------------
+export async function chat(cfg, req, { signal, onRetry, timeoutMs = 120000 } = {}) {
+  if (!cfg?.baseUrl) throw new LLMError('This model has no base URL.');
+  if (!cfg?.model) throw new LLMError('This model has no model name.');
+  const isAnthropic = cfg.format === 'anthropic';
+  const url = joinUrl(cfg.baseUrl, isAnthropic ? 'messages' : 'chat/completions');
+  const body = JSON.stringify((isAnthropic ? buildAnthropicBody : buildOpenAIBody)(cfg, req));
+
+  let lastErr;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (signal?.aborted) throw abortError();
+    await throttle(cfg, signal);
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    try {
+      const res = await fetch(url, { method: 'POST', headers: headersFor(cfg), body, signal: combined });
+      const text = await res.text();
+      if (!res.ok) {
+        const retryAfter = Number(res.headers.get('retry-after')) || 0;
+        throw new LLMError(errorMessage(res.status, text), { status: res.status, retryAfter, body: text });
+      }
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        throw new LLMError(`The endpoint returned something that isn't JSON: ${text.slice(0, 120)}`);
+      }
+      const parsed = (isAnthropic ? parseAnthropicResponse : parseOpenAIResponse)(json);
+      if (!parsed.text) throw new LLMError('The model returned an empty reply.', { status: 204 });
+      return parsed;
+    } catch (err) {
+      if (signal?.aborted) throw abortError();
+      lastErr = err instanceof LLMError ? err : new LLMError(networkMessage(err, cfg));
+      const retryable =
+        lastErr.status === 429 || lastErr.status >= 500 || lastErr.status === 204 || lastErr.status === 0;
+      if (!retryable || attempt === 3) throw lastErr;
+      const wait = Math.min(60000, lastErr.retryAfter ? lastErr.retryAfter * 1000 : 1500 * 3 ** attempt);
+      onRetry?.({ attempt: attempt + 1, waitMs: wait, error: lastErr });
+      await sleep(wait, signal);
+    }
+  }
+  throw lastErr;
+}
+
+function networkMessage(err, cfg) {
+  if (err?.name === 'TimeoutError') return 'The model took too long to answer (timeout).';
+  const local = /localhost|127\.0\.0\.1/.test(cfg.baseUrl || '');
+  return local
+    ? `Could not reach ${cfg.baseUrl}. Is the local server running? For Ollama also set OLLAMA_ORIGINS=chrome-extension://*.`
+    : `Network error reaching ${cfg.baseUrl}: ${err?.message || err}`;
+}
+
+// ---- listing models ---------------------------------------------------------------
+/** Returns [{ id, name, free, vision, context }] */
+export async function listModels(cfg, { signal } = {}) {
+  const provider = providerById(cfg.providerId);
+  if (provider.listing === 'none') throw new LLMError('This provider has no model list. Type the model name instead.');
+  const isOpenRouter = cfg.providerId === 'openrouter' || /openrouter\.ai/.test(cfg.baseUrl || '');
+  const url = joinUrl(cfg.baseUrl, 'models');
+  const res = await fetch(url, { headers: cfg.format === 'anthropic' || cfg.apiKey ? headersFor(cfg) : {}, signal }).catch((e) => {
+    throw new LLMError(networkMessage(e, cfg));
+  });
+  const text = await res.text();
+  if (!res.ok) throw new LLMError(errorMessage(res.status, text), { status: res.status });
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new LLMError('The endpoint did not return a JSON model list.');
+  }
+  const rows = json.data || json.models || [];
+  const strip = provider.stripPrefix || '';
+  return rows
+    .map((r) => {
+      const rawId = typeof r === 'string' ? r : r.id || r.name;
+      if (!rawId) return null;
+      const id = strip && rawId.startsWith(strip) ? rawId.slice(strip.length) : rawId;
+      const out = { id, name: r.name || r.display_name || id, free: false, vision: null, context: r.context_length || null };
+      if (isOpenRouter) {
+        const p = r.pricing || {};
+        out.free = Number(p.prompt) === 0 && Number(p.completion) === 0;
+        out.vision = !!r.architecture?.input_modalities?.includes('image');
+      } else if (/vision|vl\b|llava|pixtral|gemini|gemma3|llama-4|llama4|minicpm-v|qwen.*vl/i.test(id)) {
+        out.vision = true;
+      }
+      return out;
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+// ---- connection test --------------------------------------------------------------
+export async function testModel(cfg, { image } = {}) {
+  const started = performance.now();
+  const content = image
+    ? [
+        { type: 'image', mime: image.mime, data: image.data },
+        { type: 'text', text: 'What single color fills this image? Answer with one word.' },
+      ]
+    : 'Reply with the single word: OK';
+  const reply = await chat(
+    { ...cfg, rpm: 0 },
+    { system: 'You are a connectivity test.', messages: [{ role: 'user', content }], maxTokens: 30, temperature: 0 },
+    { timeoutMs: 45000 },
+  );
+  return { ms: Math.round(performance.now() - started), text: reply.text.slice(0, 80), model: reply.model };
+}

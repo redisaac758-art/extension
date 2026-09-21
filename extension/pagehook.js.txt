@@ -1,0 +1,546 @@
+// This function is serialized and injected into the page (world: MAIN) with
+// chrome.scripting.executeScript, so it MUST be fully self-contained: no imports,
+// no references to module-level variables. State lives on window.__GA__.
+//
+// Everything returned has to be JSON-serializable.
+
+export function gaPage(name, args) {
+  const NS = '__GA__';
+
+  if (!window[NS]) {
+    const G = {};
+    Object.defineProperty(window, NS, { value: G, enumerable: false, configurable: true });
+
+    // ---------------------------------------------------------------- helpers
+    const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+    const safe = (fn, fallback = null) => {
+      try {
+        return fn();
+      } catch (e) {
+        return fallback;
+      }
+    };
+    const pathStr = (p) =>
+      p.map((k, i) => (/^[A-Za-z_$][\w$]*$/.test(k) ? (i ? '.' + k : k) : `[${JSON.stringify(k)}]`)).join('');
+
+    // Names that exist on a brand-new window; everything else was defined by the page.
+    const pristine = () => {
+      if (G._pristine) return G._pristine;
+      let names = new Set();
+      try {
+        const f = document.createElement('iframe');
+        f.style.display = 'none';
+        (document.documentElement || document.body).appendChild(f);
+        names = new Set(Object.getOwnPropertyNames(f.contentWindow));
+        f.remove();
+      } catch (e) {
+        /* fall through with an empty set */
+      }
+      ['__GA__', 'chrome', 'webkitStorageInfo'].forEach((n) => names.add(n));
+      G._pristine = names;
+      return names;
+    };
+
+    const skipObject = (o) => {
+      if (o === null || typeof o !== 'object') return true;
+      try {
+        if (o === window || o === document) return true;
+        if (typeof Node !== 'undefined' && o instanceof Node) return true;
+        if (typeof Window !== 'undefined' && o instanceof Window) return true;
+        if (typeof Event !== 'undefined' && o instanceof Event) return true;
+        if (ArrayBuffer.isView(o) || o instanceof ArrayBuffer) return true;
+        if (o instanceof Promise || o instanceof WeakMap || o instanceof WeakSet) return true;
+        const tag = Object.prototype.toString.call(o);
+        if (
+          /^\[object (CanvasRenderingContext2D|WebGL\w*RenderingContext|HTMLCollection|NodeList|CSSStyleDeclaration|Storage|Navigator|Location|History|Screen|Performance|AudioContext|AudioNode|ImageBitmap|OffscreenCanvas|Blob|File|Response|Request)\]$/.test(
+            tag,
+          )
+        )
+          return true;
+      } catch (e) {
+        return true;
+      }
+      return false;
+    };
+
+    // Walk objects reachable from page-defined globals. Calls visit(pathArray, value, parentObj, key).
+    const walk = (visit, { maxDepth = 6, maxNodes = 250000, extraRoots = [] } = {}) => {
+      const seen = new WeakSet();
+      const queue = [];
+      let nodes = 0;
+      let budgetHit = false;
+      const skipNames = pristine();
+      const roots = [];
+      for (const n of safe(() => Object.getOwnPropertyNames(window), [])) {
+        if (skipNames.has(n)) continue;
+        roots.push(n);
+      }
+      for (const n of extraRoots) if (!roots.includes(n)) roots.push(n);
+      for (const n of roots) {
+        const desc = safe(() => Object.getOwnPropertyDescriptor(window, n));
+        if (!desc || !('value' in desc)) continue; // skip accessors: reading them could have side effects
+        const v = desc.value;
+        if (isNum(v)) visit([n], v, window, n);
+        else if (v && typeof v === 'object' && !skipObject(v) && !seen.has(v)) {
+          seen.add(v);
+          queue.push([v, [n], 1]);
+        }
+      }
+      let head = 0;
+      while (head < queue.length) {
+        const [obj, path, depth] = queue[head++];
+        if (++nodes > maxNodes) {
+          budgetHit = true;
+          break;
+        }
+        let keys;
+        if (Array.isArray(obj)) {
+          keys = [];
+          const len = Math.min(obj.length, 400);
+          for (let i = 0; i < len; i++) keys.push(String(i));
+        } else {
+          keys = safe(() => Object.keys(obj), []);
+          if (keys.length > 400) keys = keys.slice(0, 400);
+        }
+        for (const k of keys) {
+          const desc = safe(() => Object.getOwnPropertyDescriptor(obj, k));
+          if (!desc || !('value' in desc)) continue;
+          const v = desc.value;
+          if (isNum(v)) visit(path.concat(k), v, obj, k);
+          else if (depth < maxDepth && v && typeof v === 'object' && !seen.has(v) && !skipObject(v)) {
+            seen.add(v);
+            queue.push([v, path.concat(k), depth + 1]);
+          }
+        }
+      }
+      return { nodes, budgetHit };
+    };
+
+    const resolve = (path) => {
+      let cur = window;
+      for (let i = 0; i < path.length - 1; i++) {
+        cur = cur[path[i]];
+        if (cur === null || cur === undefined) return null;
+      }
+      return { obj: cur, key: path[path.length - 1] };
+    };
+    const readPath = (path) => {
+      const r = safe(() => resolve(path));
+      if (!r) return undefined;
+      return safe(() => r.obj[r.key], undefined);
+    };
+    const matches = (v, target, tol) => isNum(v) && Math.abs(v - target) <= tol + 1e-9;
+
+    // ---------------------------------------------------------------- FPS meter
+    G._fps = { frames: 0, t: performance.now(), value: 0 };
+    const tick = () => {
+      const f = G._fps;
+      f.frames++;
+      const now = performance.now();
+      if (now - f.t >= 1000) {
+        f.value = Math.round((f.frames * 1000) / (now - f.t));
+        f.frames = 0;
+        f.t = now;
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+
+    // ---------------------------------------------------------------- detection
+    G.detect = () => {
+      const w = window;
+      const has = (k) => safe(() => typeof w[k] !== 'undefined' && w[k] !== null, false);
+      const engines = [];
+      const add = (n, v) => engines.push(v ? { name: n, version: String(v) } : { name: n });
+      if (has('Phaser')) add('Phaser', safe(() => w.Phaser.VERSION));
+      if (has('PIXI')) add('PixiJS', safe(() => w.PIXI.VERSION));
+      if (has('THREE')) add('Three.js', safe(() => w.THREE.REVISION));
+      if (has('BABYLON')) add('Babylon.js', safe(() => w.BABYLON.Engine.Version));
+      if (has('pc') && safe(() => w.pc.Application)) add('PlayCanvas', safe(() => w.pc.version));
+      if (has('cc') && safe(() => w.cc.game)) add('Cocos', safe(() => w.cc.ENGINE_VERSION));
+      if (has('createUnityInstance') || has('UnityLoader') || has('unityInstance') || safe(() => document.querySelector('#unity-canvas, canvas[id^="unity"]')))
+        add('Unity WebGL');
+      if (has('Godot') || (has('Engine') && safe(() => typeof w.Engine.load === 'function'))) add('Godot');
+      if (has('cr_getC2Runtime') || has('c3_callFunction') || has('C3')) add('Construct');
+      if (has('$gameParty') && has('$gamePlayer')) add('RPG Maker');
+      if (has('GameMaker_Init') || has('g_pGMFile')) add('GameMaker');
+      if (has('createjs')) add('CreateJS');
+      if (has('Matter')) add('Matter.js');
+      if (has('Ruffle') || safe(() => document.querySelector('ruffle-player, ruffle-embed, ruffle-object'))) add('Ruffle (Flash)');
+      if (has('Module') && safe(() => w.Module.canvas) && !engines.some((e) => /Unity|Godot|GameMaker/.test(e.name))) add('Emscripten / WebAssembly');
+
+      const canvases = Array.from(document.querySelectorAll('canvas'))
+        .map((c) => {
+          const r = c.getBoundingClientRect();
+          return { id: c.id || '', w: c.width, h: c.height, cssW: Math.round(r.width), cssH: Math.round(r.height), visible: r.width > 40 && r.height > 40 };
+        })
+        .filter((c) => c.visible)
+        .sort((a, b) => b.cssW * b.cssH - a.cssW * a.cssH)
+        .slice(0, 4);
+
+      return {
+        url: location.href,
+        title: document.title,
+        isTop: window === window.top,
+        engines,
+        canvases,
+        iframes: document.querySelectorAll('iframe').length,
+        fps: G._fps.value,
+        hasHeap: !!getHeap(),
+        hasGame: engines.length > 0 || canvases.some((c) => c.cssW >= 200 && c.cssH >= 150),
+      };
+    };
+
+    // ---------------------------------------------------------------- DOM snapshot
+    G.snapshot = (a) => {
+      const maxText = a.maxText || 1200;
+      const maxEls = a.maxEls || 40;
+      const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) return null;
+        if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) return null;
+        const cs = getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) === 0) return null;
+        return r;
+      };
+      const cssPath = (el) => {
+        if (el.id && document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) return '#' + CSS.escape(el.id);
+        const parts = [];
+        let cur = el;
+        while (cur && cur.nodeType === 1 && parts.length < 4 && cur !== document.body) {
+          let part = cur.tagName.toLowerCase();
+          if (cur.id) {
+            parts.unshift('#' + CSS.escape(cur.id));
+            break;
+          }
+          const cls = Array.from(cur.classList).slice(0, 2).map((c) => '.' + CSS.escape(c)).join('');
+          part += cls;
+          const sibs = cur.parentElement ? Array.from(cur.parentElement.children).filter((s) => s.tagName === cur.tagName) : [];
+          if (sibs.length > 1) part += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+          parts.unshift(part);
+          cur = cur.parentElement;
+        }
+        return parts.join(' > ');
+      };
+      const elements = [];
+      for (const el of document.querySelectorAll('button, a[href], input, select, textarea, [role="button"], [onclick], summary')) {
+        if (elements.length >= maxEls) break;
+        const r = visible(el);
+        if (!r) continue;
+        const label = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || el.placeholder || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+        elements.push({
+          tag: el.tagName.toLowerCase(),
+          text: label,
+          x: Math.round(r.left + r.width / 2),
+          y: Math.round(r.top + r.height / 2),
+          selector: cssPath(el),
+        });
+      }
+      const ae = document.activeElement;
+      return {
+        url: location.href,
+        title: document.title,
+        viewport: { w: innerWidth, h: innerHeight },
+        text: (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').trim().slice(0, maxText),
+        elements,
+        focused: ae && ae !== document.body ? ae.tagName.toLowerCase() + (ae.id ? '#' + ae.id : '') : '',
+      };
+    };
+
+    G.rect = (a) => {
+      const el = document.querySelector(a.selector);
+      if (!el) return { error: 'No element matches ' + a.selector };
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const r = el.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    };
+
+    // ---------------------------------------------------------------- known game state
+    G.state = () => {
+      const out = {};
+      safe(() => {
+        if (window.$gameParty && window.$gamePlayer) {
+          out.rpgMaker = {
+            gold: safe(() => window.$gameParty.gold()),
+            members: safe(() => window.$gameParty.members().map((m) => ({ name: m.name(), level: m.level, hp: m.hp, mhp: m.mhp, mp: m.mp, mmp: m.mmp }))),
+            map: safe(() => window.$gameMap.mapId()),
+          };
+        }
+      });
+      safe(() => {
+        const g = window.Phaser && window.Phaser.GAMES && window.Phaser.GAMES[0];
+        if (g) {
+          out.phaser = {
+            scenes: safe(() => g.scene.getScenes(true).map((s) => s.sys.settings.key)),
+            fps: safe(() => Math.round(g.loop.actualFps)),
+          };
+        }
+      });
+      return out;
+    };
+
+    // Look for conventionally named values (score, lives, hp...) near the top of the object graph.
+    G.common = () => {
+      const re = /^(score|highscore|best|lives|life|level|lvl|health|hp|mp|energy|money|gold|coins?|cash|points?|xp|exp|stage|wave|ammo|combo|kills?|distance)$/i;
+      const found = [];
+      walk(
+        (path, v) => {
+          if (found.length < 40 && re.test(path[path.length - 1])) found.push({ path, label: pathStr(path), value: v });
+        },
+        { maxDepth: 3, maxNodes: 30000 },
+      );
+      return found;
+    };
+
+    G.readPaths = (a) =>
+      (a.paths || []).map((p) => {
+        const v = readPath(p);
+        const kind = typeof v;
+        return { path: p, ok: v !== undefined, value: kind === 'number' || kind === 'string' || kind === 'boolean' ? v : v === undefined ? null : kind };
+      });
+
+    // ---------------------------------------------------------------- JS object scanner
+    G.scanStart = (a) => {
+      const t0 = performance.now();
+      const cap = a.maxCands || 200000;
+      const cands = [];
+      const want = a.mode === 'exact' ? Number(a.value) : null;
+      if (a.mode === 'exact' && !Number.isFinite(want)) return { error: 'Enter a number to search for.' };
+      const tol = a.tol || 0;
+      let truncated = false;
+      const stats = walk(
+        (path, v) => {
+          if (cands.length >= cap) {
+            truncated = true;
+            return;
+          }
+          if (want === null || matches(v, want, tol)) cands.push({ p: path, v });
+        },
+        { maxDepth: a.maxDepth || 7, maxNodes: a.maxNodes || 250000 },
+      );
+      G.cands = cands;
+      return { count: cands.length, truncated: truncated || stats.budgetHit, nodes: stats.nodes, ms: Math.round(performance.now() - t0) };
+    };
+
+    G.scanNext = (a) => {
+      if (!G.cands) return { error: 'Start a scan first.' };
+      const want = Number(a.value);
+      if (a.mode === 'exact' && !Number.isFinite(want)) return { error: 'Enter a number to search for.' };
+      const tol = a.tol || 0;
+      const next = [];
+      for (const c of G.cands) {
+        const v = readPath(c.p);
+        if (!isNum(v)) continue;
+        let keep = false;
+        switch (a.mode) {
+          case 'exact': keep = matches(v, want, tol); break;
+          case 'changed': keep = v !== c.v; break;
+          case 'unchanged': keep = v === c.v; break;
+          case 'increased': keep = v > c.v; break;
+          case 'decreased': keep = v < c.v; break;
+          default: keep = false;
+        }
+        if (keep) next.push({ p: c.p, v });
+      }
+      G.cands = next;
+      return { count: next.length };
+    };
+
+    G.scanList = (a) => {
+      const list = G.cands || [];
+      const off = a.offset || 0;
+      const lim = a.limit || 60;
+      return {
+        total: list.length,
+        items: list.slice(off, off + lim).map((c, i) => ({ i: off + i, path: c.p, label: pathStr(c.p), value: readPath(c.p) ?? null })),
+      };
+    };
+    G.scanReset = () => {
+      G.cands = null;
+      return { ok: true };
+    };
+
+    G.write = (a) => {
+      const r = safe(() => resolve(a.path));
+      if (!r) return { error: 'That path no longer exists.' };
+      const v = Number(a.value);
+      if (!Number.isFinite(v)) return { error: 'Enter a number.' };
+      try {
+        r.obj[r.key] = v;
+      } catch (e) {
+        return { error: 'The game refused the write: ' + e.message };
+      }
+      const now = safe(() => r.obj[r.key]);
+      return now === v ? { ok: true, value: now } : { error: 'The game changed the value back (read-only or recalculated).', value: now };
+    };
+
+    // ---------------------------------------------------------------- freezing values
+    G._frozen = G._frozen || new Map();
+    G.freeze = (a) => {
+      const key = 'js:' + JSON.stringify(a.path);
+      if (G._frozen.has(key)) clearInterval(G._frozen.get(key).timer);
+      const value = Number(a.value);
+      if (!Number.isFinite(value)) return { error: 'Enter a number.' };
+      const timer = setInterval(() => {
+        const r = safe(() => resolve(a.path));
+        if (r) safe(() => (r.obj[r.key] = value));
+      }, Math.max(16, a.ms || 100));
+      G._frozen.set(key, { kind: 'js', path: a.path, label: pathStr(a.path), value, timer });
+      return { ok: true };
+    };
+    G.unfreeze = (a) => {
+      const key = a.kind === 'mem' ? 'mem:' + a.addr + ':' + a.type : 'js:' + JSON.stringify(a.path);
+      const f = G._frozen.get(key);
+      if (f) clearInterval(f.timer);
+      G._frozen.delete(key);
+      return { ok: true };
+    };
+    G.frozenList = () =>
+      Array.from(G._frozen.values()).map((f) => ({ kind: f.kind, path: f.path, addr: f.addr, type: f.type, label: f.label || '0x' + (f.addr || 0).toString(16), value: f.value }));
+    G.unfreezeAll = () => {
+      G._frozen.forEach((f) => clearInterval(f.timer));
+      G._frozen.clear();
+      return { ok: true };
+    };
+
+    // ---------------------------------------------------------------- WebAssembly heap scanner
+    function getHeap() {
+      const mods = [window.Module, window.unityInstance && window.unityInstance.Module, window.Module && window.Module.asm];
+      for (const m of mods) {
+        const buf = safe(() => (m && m.HEAP8 && m.HEAP8.buffer) || (m && m.wasmMemory && m.wasmMemory.buffer));
+        if (buf) return buf;
+      }
+      return null;
+    }
+    const viewFor = (type, buf) => (type === 'f64' ? new Float64Array(buf) : type === 'f32' ? new Float32Array(buf) : new Int32Array(buf));
+    const sizeOf = (type) => (type === 'f64' ? 8 : 4);
+
+    G.memStart = (a) => {
+      const buf = getHeap();
+      if (!buf) return { error: 'No WebAssembly heap found. This works on Emscripten and Unity WebGL games that expose a Module.' };
+      const want = Number(a.value);
+      if (!Number.isFinite(want)) return { error: 'Enter a number to search for.' };
+      const t0 = performance.now();
+      const size = sizeOf(a.type);
+      const view = viewFor(a.type, buf);
+      const tol = a.type === 'i32' ? 0 : Math.max(a.tol || 0, Math.abs(want) * 1e-6);
+      const cap = a.maxCands || 500000;
+      const addrs = [];
+      const vals = [];
+      let truncated = false;
+      for (let i = 0; i < view.length; i++) {
+        const v = view[i];
+        if (v === want || (tol && Math.abs(v - want) <= tol)) {
+          if (addrs.length >= cap) {
+            truncated = true;
+            break;
+          }
+          addrs.push(i * size);
+          vals.push(v);
+        }
+      }
+      G.mem = { type: a.type, addrs, vals };
+      return { count: addrs.length, truncated, ms: Math.round(performance.now() - t0), heapMB: Math.round(buf.byteLength / 1048576) };
+    };
+
+    G.memNext = (a) => {
+      if (!G.mem) return { error: 'Start a memory scan first.' };
+      const buf = getHeap();
+      if (!buf) return { error: 'The heap is no longer available.' };
+      const m = G.mem;
+      const view = viewFor(m.type, buf);
+      const size = sizeOf(m.type);
+      const want = Number(a.value);
+      const tol = m.type === 'i32' ? 0 : Math.max(a.tol || 0, Math.abs(want) * 1e-6);
+      const addrs = [];
+      const vals = [];
+      for (let k = 0; k < m.addrs.length; k++) {
+        const v = view[m.addrs[k] / size];
+        if (v === undefined) continue;
+        let keep = false;
+        switch (a.mode) {
+          case 'exact': keep = v === want || (tol && Math.abs(v - want) <= tol); break;
+          case 'changed': keep = v !== m.vals[k]; break;
+          case 'unchanged': keep = v === m.vals[k]; break;
+          case 'increased': keep = v > m.vals[k]; break;
+          case 'decreased': keep = v < m.vals[k]; break;
+        }
+        if (keep) {
+          addrs.push(m.addrs[k]);
+          vals.push(v);
+        }
+      }
+      G.mem = { type: m.type, addrs, vals };
+      return { count: addrs.length };
+    };
+
+    G.memList = (a) => {
+      if (!G.mem) return { total: 0, items: [] };
+      const buf = getHeap();
+      const m = G.mem;
+      const view = buf ? viewFor(m.type, buf) : null;
+      const size = sizeOf(m.type);
+      const off = a.offset || 0;
+      const lim = a.limit || 60;
+      return {
+        total: m.addrs.length,
+        type: m.type,
+        items: m.addrs.slice(off, off + lim).map((addr, i) => ({ i: off + i, addr, label: '0x' + addr.toString(16), value: view ? view[addr / size] : null })),
+      };
+    };
+    G.memReset = () => {
+      G.mem = null;
+      return { ok: true };
+    };
+    G.memWrite = (a) => {
+      const buf = getHeap();
+      if (!buf) return { error: 'The heap is no longer available.' };
+      const view = viewFor(a.type, buf);
+      const v = Number(a.value);
+      if (!Number.isFinite(v)) return { error: 'Enter a number.' };
+      view[a.addr / sizeOf(a.type)] = v;
+      return { ok: true, value: view[a.addr / sizeOf(a.type)] };
+    };
+    G.memFreeze = (a) => {
+      const key = 'mem:' + a.addr + ':' + a.type;
+      if (G._frozen.has(key)) clearInterval(G._frozen.get(key).timer);
+      const value = Number(a.value);
+      if (!Number.isFinite(value)) return { error: 'Enter a number.' };
+      const timer = setInterval(() => {
+        const buf = getHeap();
+        if (buf) viewFor(a.type, buf)[a.addr / sizeOf(a.type)] = value;
+      }, Math.max(16, a.ms || 100));
+      G._frozen.set(key, { kind: 'mem', addr: a.addr, type: a.type, value, timer });
+      return { ok: true };
+    };
+
+    // ---------------------------------------------------------------- on-page badge
+    G.badge = (a) => {
+      const id = '__ga_badge__';
+      let el = document.getElementById(id);
+      if (!a.show) {
+        if (el) el.remove();
+        return { ok: true };
+      }
+      if (!el) {
+        el = document.createElement('div');
+        el.id = id;
+        el.style.cssText =
+          'position:fixed;z-index:2147483647;left:50%;top:8px;transform:translateX(-50%);padding:5px 12px;border-radius:999px;' +
+          'background:#12101c;color:#46e0d3;border:1px solid #46e0d3;font:600 12px/1.2 system-ui,sans-serif;pointer-events:none;' +
+          'box-shadow:0 2px 12px rgba(0,0,0,.4);opacity:.92';
+        (document.documentElement || document.body).appendChild(el);
+      }
+      el.textContent = a.text || 'Game Agent is active';
+      return { ok: true };
+    };
+  }
+
+  const fn = window[NS][name];
+  if (typeof fn !== 'function') return { error: 'Unknown call: ' + name };
+  try {
+    return fn(args || {});
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  }
+}

@@ -1,0 +1,104 @@
+// Maps KeyboardEvent.key style names to the fields Chrome DevTools Protocol needs.
+// Modifier bits for CDP: Alt=1, Ctrl=2, Meta=4, Shift=8.
+
+const NAMED = {
+  Enter: { code: 'Enter', vk: 13, text: '\r' },
+  Escape: { code: 'Escape', vk: 27 },
+  Tab: { code: 'Tab', vk: 9 },
+  Backspace: { code: 'Backspace', vk: 8 },
+  Delete: { code: 'Delete', vk: 46 },
+  Insert: { code: 'Insert', vk: 45 },
+  Home: { code: 'Home', vk: 36 },
+  End: { code: 'End', vk: 35 },
+  PageUp: { code: 'PageUp', vk: 33 },
+  PageDown: { code: 'PageDown', vk: 34 },
+  ArrowLeft: { code: 'ArrowLeft', vk: 37 },
+  ArrowUp: { code: 'ArrowUp', vk: 38 },
+  ArrowRight: { code: 'ArrowRight', vk: 39 },
+  ArrowDown: { code: 'ArrowDown', vk: 40 },
+  ' ': { code: 'Space', vk: 32, text: ' ' },
+  Shift: { code: 'ShiftLeft', vk: 16, mod: 8 },
+  Control: { code: 'ControlLeft', vk: 17, mod: 2 },
+  Alt: { code: 'AltLeft', vk: 18, mod: 1 },
+  Meta: { code: 'MetaLeft', vk: 91, mod: 4 },
+  CapsLock: { code: 'CapsLock', vk: 20 },
+};
+for (let i = 1; i <= 12; i++) NAMED[`F${i}`] = { code: `F${i}`, vk: 111 + i };
+
+const ALIASES = {
+  space: ' ',
+  spacebar: ' ',
+  esc: 'Escape',
+  return: 'Enter',
+  ctrl: 'Control',
+  control: 'Control',
+  cmd: 'Meta',
+  command: 'Meta',
+  win: 'Meta',
+  option: 'Alt',
+  del: 'Delete',
+  up: 'ArrowUp',
+  down: 'ArrowDown',
+  left: 'ArrowLeft',
+  right: 'ArrowRight',
+  pgup: 'PageUp',
+  pgdn: 'PageDown',
+};
+
+const PUNCT = {
+  '-': ['Minus', 189],
+  '_': ['Minus', 189],
+  '=': ['Equal', 187],
+  '+': ['Equal', 187],
+  '[': ['BracketLeft', 219],
+  ']': ['BracketRight', 221],
+  '\\': ['Backslash', 220],
+  ';': ['Semicolon', 186],
+  ':': ['Semicolon', 186],
+  "'": ['Quote', 222],
+  '"': ['Quote', 222],
+  ',': ['Comma', 188],
+  '.': ['Period', 190],
+  '/': ['Slash', 191],
+  '?': ['Slash', 191],
+  '`': ['Backquote', 192],
+  '!': ['Digit1', 49],
+  '@': ['Digit2', 50],
+  '#': ['Digit3', 51],
+  '$': ['Digit4', 52],
+  '%': ['Digit5', 53],
+  '^': ['Digit6', 54],
+  '&': ['Digit7', 55],
+  '*': ['Digit8', 56],
+  '(': ['Digit9', 57],
+  ')': ['Digit0', 48],
+};
+
+export function resolveKey(name) {
+  let raw = String(name);
+  const lower = raw.toLowerCase();
+  if (ALIASES[lower] !== undefined) raw = ALIASES[lower];
+  else if (raw.length > 1) {
+    // Case-insensitive lookup for names like "arrowup" or "enter".
+    const hit = Object.keys(NAMED).find((k) => k.toLowerCase() === lower);
+    if (hit) raw = hit;
+  }
+  if (NAMED[raw]) return { key: raw, ...NAMED[raw], mod: NAMED[raw].mod || 0 };
+  if (raw.length === 1) {
+    if (/[a-z]/i.test(raw)) {
+      const up = raw.toUpperCase();
+      return { key: raw, code: `Key${up}`, vk: up.charCodeAt(0), text: raw, mod: 0 };
+    }
+    if (/[0-9]/.test(raw)) return { key: raw, code: `Digit${raw}`, vk: raw.charCodeAt(0), text: raw, mod: 0 };
+    if (PUNCT[raw]) return { key: raw, code: PUNCT[raw][0], vk: PUNCT[raw][1], text: raw, mod: 0 };
+  }
+  throw new Error(`Unknown key "${name}"`);
+}
+
+/** "Control+Shift+K" -> [Control, Shift, K]. A trailing "+" key is supported ("Shift++"). */
+export function parseCombo(spec) {
+  const s = String(spec);
+  if (s === '+') return [resolveKey('+')];
+  const parts = s.endsWith('++') ? [...s.slice(0, -2).split('+'), '+'] : s.split('+');
+  return parts.filter((p) => p !== '').map(resolveKey);
+}

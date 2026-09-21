@@ -1,0 +1,392 @@
+import * as cdp from './cdp.js';
+import { captureTab } from './capture.js';
+import { chat } from './llm.js';
+import { buildSystem, buildUser, normalizeReply, describeAction } from './prompts.js';
+import { detectAll, callAll, callFrame, readWatches, showBadge } from './game.js';
+import { extractJson, sleep, uid, hostOf, clamp, truncate } from './util.js';
+import * as store from './storage.js';
+
+const ok = (msg) => ({ ok: true, msg });
+const bad = (msg) => ({ ok: false, msg });
+
+/**
+ * Runs one game session at a time. Emits:
+ *   start, progress {step,max}, frame {src,w,h}, log {entry}, approval {actions}, status, end {status,message}
+ * Modes:
+ *   observe - one screenshot, one answer, no input (no debugger bar)
+ *   assist  - proposes actions each step; the player approves, skips or stops
+ *   auto    - executes actions until done, stopped, or out of steps
+ */
+export class Agent extends EventTarget {
+  constructor() {
+    super();
+    this.run = null;
+    this._approval = null;
+    this._offDetach = null;
+  }
+
+  get running() {
+    return !!this.run && !this.run.ended;
+  }
+
+  emit(type, detail = {}) {
+    this.dispatchEvent(new CustomEvent(type, { detail }));
+  }
+
+  snapshot() {
+    if (!this.run) return null;
+    const { abort, memory, ...rest } = this.run;
+    return rest;
+  }
+
+  async start({ tab, goal, mode, model, preset, settings }) {
+    if (this.running) throw new Error('A run is already active.');
+    if (!model) throw new Error('Add a model in the Models tab first.');
+    if (!goal?.trim()) throw new Error('Describe what the agent should do.');
+    if (!/^https?:/i.test(tab?.url || '')) throw new Error('Open the game on a normal website (http or https) first.');
+
+    const run = {
+      id: uid('run'),
+      tabId: tab.id,
+      url: tab.url,
+      host: hostOf(tab.url),
+      goal: goal.trim(),
+      mode,
+      model: { id: model.id, name: model.name, model: model.model },
+      preset: preset ? { id: preset.id, name: preset.name } : null,
+      step: 0,
+      maxSteps: mode === 'observe' ? 1 : settings.maxSteps,
+      status: 'running',
+      startedAt: Date.now(),
+      ended: false,
+      log: [],
+      memory: [],
+      abort: new AbortController(),
+    };
+    this.run = run;
+    this.emit('start', this.snapshot());
+    if (!model.vision && settings.sendScreenshots) {
+      this._log(run, {
+        kind: 'info',
+        text: 'This model does not see images, so it only gets the page text, element list and watched values. Turn on "Sees images" for a vision model to let it look at the screen.',
+      });
+    }
+    this._loop(run, model, preset, settings).catch((err) => this._end(run, 'error', err?.message || String(err)));
+    return run.id;
+  }
+
+  stop(reason = 'Stopped by you') {
+    if (!this.running) return;
+    this._end(this.run, 'stopped', reason);
+  }
+
+  resolveApproval(decision) {
+    this._approval?.(decision);
+  }
+
+  // ------------------------------------------------------------------------------------
+  _log(run, entry) {
+    const e = { t: Date.now(), ...entry };
+    run.log.push(e);
+    this.emit('log', e);
+  }
+
+  async _end(run, status, message) {
+    if (run.ended) return;
+    run.ended = true;
+    run.status = status;
+    run.message = message;
+    run.endedAt = Date.now();
+    run.abort.abort();
+    this._approval?.({ type: 'stop' });
+    this._offDetach?.();
+    this._offDetach = null;
+    this.emit('end', { status, message, run: this.snapshot() });
+    try {
+      if (run.mode !== 'observe') {
+        await showBadge(run.tabId, false).catch(() => {});
+        await cdp.detach(run.tabId);
+      }
+    } catch {
+      /* tab may be gone */
+    }
+    try {
+      await store.addHistory({
+        id: run.id,
+        ts: run.startedAt,
+        endedAt: run.endedAt,
+        host: run.host,
+        url: run.url,
+        goal: run.goal,
+        mode: run.mode,
+        model: run.model.name,
+        steps: run.step,
+        status,
+        message,
+        log: run.log.filter((e) => e.kind !== 'info').slice(-200),
+      });
+    } catch {
+      /* storage full or unavailable */
+    }
+  }
+
+  async _loop(run, model, preset, settings) {
+    const { signal } = run.abort;
+    const useShots = !!model.vision && settings.sendScreenshots;
+    try {
+      if (run.mode !== 'observe') {
+        await cdp.attach(run.tabId, { focus: settings.focusEmulation });
+        this._offDetach = cdp.onDetach((tabId) => {
+          if (tabId === run.tabId && !run.ended) this.stop('Chrome detached the debugger (the tab closed or the bar was dismissed).');
+        });
+        if (settings.showBadge) await showBadge(run.tabId, true, 'Game Agent is active - press Alt+Shift+X to stop');
+      }
+
+      const system = buildSystem({ mode: run.mode, preset, allowEval: settings.allowEval, maxActions: settings.actionsPerStep });
+      let prevShot = null;
+      let fails = 0;
+      let problems = [];
+
+      while (!signal.aborted && run.step < run.maxSteps) {
+        run.step++;
+        this.emit('progress', { step: run.step, max: run.maxSteps });
+
+        let shot = null;
+        if (useShots) {
+          try {
+            shot = await this._capture(run, settings);
+            this.emit('frame', { src: `data:${shot.mime};base64,${shot.data}`, w: shot.width, h: shot.height });
+          } catch (err) {
+            if (signal.aborted) return;
+            fails++;
+            this._log(run, { kind: 'error', step: run.step, text: `Screenshot failed: ${err.message}` });
+            if (fails >= 3) return this._end(run, 'error', `Could not capture the game tab. ${err.message}`);
+            await sleep(800, signal);
+            continue;
+          }
+        }
+
+        const ctx = await this._context(run, settings);
+        const space = shot
+          ? { scale: shot.scale, width: shot.width, height: shot.height }
+          : { scale: 1, width: ctx.page?.viewport?.w || 1280, height: ctx.page?.viewport?.h || 720 };
+
+        let result;
+        try {
+          result = await this._ask({ run, model, system, settings, shot, prevShot: settings.sendPrevFrame ? prevShot : null, space, ctx, errors: problems, signal });
+          fails = 0;
+        } catch (err) {
+          if (signal.aborted || run.ended) return;
+          fails++;
+          this._log(run, { kind: 'error', step: run.step, text: err.message });
+          if (fails >= 3 || err.status === 401 || err.status === 403 || err.status === 404) {
+            return this._end(run, 'error', err.message);
+          }
+          await sleep(1200, signal);
+          continue;
+        }
+        problems = result.problems;
+        prevShot = shot;
+        const r = result.reply;
+        this._log(run, { kind: 'step', step: run.step, observation: r.observation, plan: r.plan, actions: r.actions, message: r.message });
+        if (problems.length) this._log(run, { kind: 'info', text: 'Reply adjusted: ' + problems.join('; ') });
+
+        if (run.mode === 'observe') return this._end(run, 'done', r.message || r.observation || 'Done.');
+        if (r.done && !r.actions.length) return this._end(run, 'done', r.message || 'Done.');
+
+        let actions = r.actions;
+        if (run.mode === 'assist' && actions.length) {
+          const decision = await this._askApproval(run, actions);
+          if (decision.type === 'stop' || run.ended) return;
+          if (decision.type === 'skip') {
+            this._log(run, { kind: 'result', step: run.step, results: [bad('Skipped by you')] });
+            this._remember(run, settings, { step: run.step, observation: r.observation, actions, results: ['skipped by the player'] });
+            continue;
+          }
+          actions = decision.actions || actions;
+        }
+
+        const results = await this._execute(run, actions, space, settings, signal);
+        this._remember(run, settings, { step: run.step, observation: r.observation, actions, results: results.map((x) => x.msg) });
+        if (r.done) return this._end(run, 'done', r.message || 'Done.');
+        await sleep(settings.stepDelayMs, signal);
+      }
+      if (!run.ended) this._end(run, 'done', `Reached the step limit (${run.maxSteps}).`);
+    } catch (err) {
+      if (run.ended || err?.name === 'AbortError') return;
+      this._end(run, 'error', err?.message || String(err));
+    }
+  }
+
+  _remember(run, settings, entry) {
+    run.memory.push(entry);
+    while (run.memory.length > settings.promptHistory) run.memory.shift();
+  }
+
+  async _capture(run, settings) {
+    if (run.mode === 'observe') {
+      return captureTab(run.tabId, { maxWidth: settings.shotWidth, quality: settings.jpegQuality / 100 });
+    }
+    return cdp.screenshot(run.tabId, { maxWidth: settings.shotWidth, quality: settings.jpegQuality });
+  }
+
+  async _context(run, settings) {
+    const ctx = { engines: [], fps: 0, state: {}, watches: [], page: { url: run.url, title: '' } };
+    try {
+      const det = await detectAll(run.tabId);
+      if (det.best) {
+        ctx.engines = det.best.engines;
+        ctx.fps = det.best.fps;
+      }
+      const states = await callAll(run.tabId, 'state');
+      for (const r of states) {
+        if (r.result && !r.result.error) Object.assign(ctx.state, r.result);
+      }
+      if (settings.includeDom) {
+        const snap = await callFrame(run.tabId, 0, 'snapshot', {});
+        if (snap && !snap.error) ctx.page = snap;
+      }
+      const watches = (await store.getWatches())[run.host] || [];
+      ctx.watches = await readWatches(run.tabId, watches);
+    } catch {
+      /* a partial context is fine */
+    }
+    return ctx;
+  }
+
+  async _ask({ run, model, system, settings, shot, prevShot, space, ctx, errors, signal }) {
+    const parts = buildUser({
+      goal: run.goal,
+      mode: run.mode,
+      step: run.step,
+      maxSteps: run.maxSteps,
+      shot,
+      prevShot,
+      space,
+      ctx,
+      memory: run.memory,
+      allowEval: settings.allowEval,
+      errors,
+    });
+    const messages = [{ role: 'user', content: parts }];
+    const opts = {
+      signal,
+      onRetry: ({ attempt, waitMs, error }) =>
+        this._log(run, { kind: 'info', text: `${error.message} Retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt}).` }),
+    };
+    const req = () => ({ system, messages, maxTokens: model.maxTokens, temperature: model.temperature });
+
+    let res = await chat(model, req(), opts);
+    let json = extractJson(res.text);
+    if (!json) {
+      messages.push(
+        { role: 'assistant', content: res.text.slice(0, 2000) },
+        { role: 'user', content: 'That was not a valid JSON object. Reply again with only the JSON object described in the instructions.' },
+      );
+      res = await chat(model, req(), opts);
+      json = extractJson(res.text);
+    }
+    if (!json) throw new Error('The model did not return valid JSON. Try a stronger model or lower its temperature.');
+    return normalizeReply(json, { maxActions: settings.actionsPerStep, allowEval: settings.allowEval });
+  }
+
+  _askApproval(run, actions) {
+    run.status = 'waiting';
+    this.emit('status', { status: 'waiting' });
+    return new Promise((resolve) => {
+      this._approval = resolve;
+      this.emit('approval', { actions });
+    }).finally(() => {
+      this._approval = null;
+      if (!run.ended) {
+        run.status = 'running';
+        this.emit('status', { status: 'running' });
+      }
+    });
+  }
+
+  async _execute(run, actions, space, settings, signal) {
+    const results = [];
+    for (const a of actions) {
+      if (signal.aborted) break;
+      let res;
+      try {
+        res = await this._doAction(run, a, space, settings, signal);
+      } catch (err) {
+        if (err?.name === 'AbortError') throw err;
+        res = bad(`${describeAction(a)} failed: ${err.message}`);
+      }
+      results.push(res);
+    }
+    this._log(run, { kind: 'result', step: run.step, results });
+    return results;
+  }
+
+  async _doAction(run, a, space, settings, signal) {
+    const tab = run.tabId;
+    const inBounds = (x, y) => Number.isFinite(x) && Number.isFinite(y) && x >= 0 && y >= 0 && x <= space.width && y <= space.height;
+    const css = (p) => ({ x: p.x / space.scale, y: p.y / space.scale });
+    const d = describeAction(a);
+
+    switch (a.type) {
+      case 'click': {
+        const x = Number(a.x);
+        const y = Number(a.y);
+        if (!inBounds(x, y)) return bad(`${d} is outside the ${space.width}x${space.height} screenshot`);
+        const p = css({ x, y });
+        await cdp.click(tab, p.x, p.y, { button: a.button, count: clamp(Number(a.count) || 1, 1, 5) });
+        return ok(d);
+      }
+      case 'move': {
+        const x = Number(a.x);
+        const y = Number(a.y);
+        if (!inBounds(x, y)) return bad(`${d} is outside the screenshot`);
+        const p = css({ x, y });
+        await cdp.mouseMove(tab, p.x, p.y);
+        return ok(d);
+      }
+      case 'drag': {
+        const from = { x: Number(a.from?.x), y: Number(a.from?.y) };
+        const to = { x: Number(a.to?.x), y: Number(a.to?.y) };
+        if (!inBounds(from.x, from.y) || !inBounds(to.x, to.y)) return bad(`${d} is outside the screenshot`);
+        await cdp.drag(tab, css(from), css(to), clamp(Number(a.ms) || 300, 50, 3000));
+        return ok(d);
+      }
+      case 'key':
+        await cdp.pressKey(tab, String(a.key), clamp(Number(a.hold_ms) || 0, 0, 5000));
+        return ok(d);
+      case 'key_down':
+        await cdp.keyDown(tab, String(a.key));
+        return ok(d);
+      case 'key_up':
+        await cdp.keyUp(tab, String(a.key));
+        return ok(d);
+      case 'type':
+        await cdp.typeText(tab, String(a.text ?? ''));
+        return ok(d);
+      case 'scroll': {
+        const x = Number(a.x ?? space.width / 2);
+        const y = Number(a.y ?? space.height / 2);
+        const p = css({ x, y });
+        await cdp.wheel(tab, p.x, p.y, Number(a.dx) || 0, Number(a.dy) || 0);
+        return ok(d);
+      }
+      case 'wait':
+        await sleep(clamp(Number(a.ms) || 500, 0, 5000), signal);
+        return ok(d);
+      case 'click_selector': {
+        const r = await callFrame(tab, 0, 'rect', { selector: String(a.selector) });
+        if (!r || r.error) return bad(`${d}: ${r?.error || 'element not found'}`);
+        await cdp.click(tab, r.x, r.y);
+        return ok(d);
+      }
+      case 'eval': {
+        if (!settings.allowEval) return bad('eval is disabled in Settings');
+        const value = await cdp.evaluate(tab, String(a.code));
+        return ok(`${d} -> ${truncate(JSON.stringify(value) ?? 'undefined', 200)}`);
+      }
+      default:
+        return bad(`Unknown action ${a.type}`);
+    }
+  }
+}

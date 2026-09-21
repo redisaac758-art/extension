@@ -1,0 +1,33 @@
+// Captures the visible tab without attaching the debugger (no Chrome debugging bar).
+// The tab has to be the active tab of its window.
+
+export async function captureTab(tabId, { maxWidth = 960, quality = 0.6 } = {}) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab.active) {
+    throw new Error('The game tab has to be the visible tab in its window so it can be captured.');
+  }
+  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+  const blob = await (await fetch(dataUrl)).blob();
+  const bmp = await createImageBitmap(blob);
+  const bw = bmp.width;
+  const bh = bmp.height;
+  const scale = Math.min(1, maxWidth / bw);
+  const w = Math.round(bw * scale);
+  const h = Math.round(bh * scale);
+  const canvas = new OffscreenCanvas(w, h);
+  canvas.getContext('2d').drawImage(bmp, 0, 0, w, h);
+  const out = await canvas.convertToBlob({ type: 'image/jpeg', quality });
+  const buf = new Uint8Array(await out.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode(...buf.subarray(i, i + 0x8000));
+  bmp.close?.();
+  return {
+    data: btoa(bin),
+    mime: 'image/jpeg',
+    width: w,
+    height: h,
+    scale: w / (tab.width || bw),
+    cssWidth: tab.width || bw,
+    cssHeight: tab.height || bh,
+  };
+}

@@ -1,0 +1,200 @@
+import * as store from './storage.js';
+
+// Minimal Supabase client (Auth + PostgREST) so the extension needs no bundler or SDK.
+// Optional: the extension works fully offline without it.
+//
+// What is synced: settings (without secrets), presets, model configs WITHOUT api keys, run history.
+// API keys never leave this browser.
+
+const clean = (url) => String(url || '').replace(/\/+$/, '');
+
+function authHeaders(cfg, token) {
+  return {
+    apikey: cfg.anonKey,
+    Authorization: `Bearer ${token || cfg.anonKey}`,
+    'Content-Type': 'application/json',
+  };
+}
+
+async function parse(res) {
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    /* not json */
+  }
+  if (!res.ok) {
+    const msg = json?.msg || json?.error_description || json?.message || json?.error || text || res.statusText;
+    throw new Error(`Supabase: ${msg}`);
+  }
+  return json;
+}
+
+function requireConfig(cfg) {
+  if (!cfg.url || !cfg.anonKey) throw new Error('Enter your Supabase project URL and anon key first.');
+}
+
+function sessionFrom(json) {
+  return {
+    access_token: json.access_token,
+    refresh_token: json.refresh_token,
+    expires_at: json.expires_at ? json.expires_at * 1000 : Date.now() + (json.expires_in || 3600) * 1000,
+    user: json.user ? { id: json.user.id, email: json.user.email } : null,
+  };
+}
+
+export async function signUp(email, password) {
+  const cfg = await store.getSupabase();
+  requireConfig(cfg);
+  const res = await fetch(`${clean(cfg.url)}/auth/v1/signup`, {
+    method: 'POST',
+    headers: authHeaders(cfg),
+    body: JSON.stringify({ email, password }),
+  });
+  const json = await parse(res);
+  if (json?.access_token) {
+    const session = sessionFrom(json);
+    await store.saveSupabase({ session });
+    return { session, needsConfirmation: false };
+  }
+  return { session: null, needsConfirmation: true };
+}
+
+export async function signIn(email, password) {
+  const cfg = await store.getSupabase();
+  requireConfig(cfg);
+  const res = await fetch(`${clean(cfg.url)}/auth/v1/token?grant_type=password`, {
+    method: 'POST',
+    headers: authHeaders(cfg),
+    body: JSON.stringify({ email, password }),
+  });
+  const session = sessionFrom(await parse(res));
+  await store.saveSupabase({ session });
+  return session;
+}
+
+export async function signOut() {
+  const cfg = await store.getSupabase();
+  if (cfg.session?.access_token && cfg.url) {
+    await fetch(`${clean(cfg.url)}/auth/v1/logout`, {
+      method: 'POST',
+      headers: authHeaders(cfg, cfg.session.access_token),
+    }).catch(() => {});
+  }
+  await store.saveSupabase({ session: null });
+}
+
+async function freshSession() {
+  const cfg = await store.getSupabase();
+  requireConfig(cfg);
+  const s = cfg.session;
+  if (!s?.access_token) throw new Error('Sign in first.');
+  if (s.expires_at - Date.now() > 60000) return { cfg, session: s };
+  const res = await fetch(`${clean(cfg.url)}/auth/v1/token?grant_type=refresh_token`, {
+    method: 'POST',
+    headers: authHeaders(cfg),
+    body: JSON.stringify({ refresh_token: s.refresh_token }),
+  });
+  const session = sessionFrom(await parse(res));
+  await store.saveSupabase({ session });
+  return { cfg: { ...cfg, session }, session };
+}
+
+async function rest(method, table, { query = '', body, prefer } = {}) {
+  const { cfg, session } = await freshSession();
+  const headers = authHeaders(cfg, session.access_token);
+  if (prefer) headers.Prefer = prefer;
+  const res = await fetch(`${clean(cfg.url)}/rest/v1/${table}${query}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return parse(res);
+}
+
+const upsert = (table, rows, conflict) =>
+  rows.length
+    ? rest('POST', table, { query: `?on_conflict=${conflict}`, body: rows, prefer: 'resolution=merge-duplicates,return=minimal' })
+    : Promise.resolve();
+
+const stripKeys = (m) => {
+  const { apiKey, ...rest } = m;
+  return rest;
+};
+
+// ---- push / pull -------------------------------------------------------------------
+export async function pushAll() {
+  const { session } = await freshSession();
+  const uid = session.user?.id;
+  if (!uid) throw new Error('Could not read your user id. Sign in again.');
+  const now = new Date().toISOString();
+  const [settings, presets, models, history] = await Promise.all([
+    store.getSettings(),
+    store.getPresets(),
+    store.getModels(),
+    store.getHistory(),
+  ]);
+
+  // Device-specific and safety-related settings stay local.
+  const { activeModelId, autoSync, approvedHosts, allowEval, ...portable } = settings;
+  await upsert('ga_settings', [{ user_id: uid, data: portable, updated_at: now }], 'user_id');
+  await upsert(
+    'ga_presets',
+    presets.map((p) => ({ user_id: uid, id: p.id, data: p, updated_at: new Date(p.updatedAt || Date.now()).toISOString() })),
+    'user_id,id',
+  );
+  await upsert(
+    'ga_models',
+    models.map((m) => ({ user_id: uid, id: m.id, data: stripKeys(m), updated_at: now })),
+    'user_id,id',
+  );
+  await upsert(
+    'ga_runs',
+    history.slice(0, 40).map((h) => ({ user_id: uid, id: h.id, data: h, created_at: new Date(h.ts).toISOString() })),
+    'user_id,id',
+  );
+  return { presets: presets.length, models: models.length, runs: Math.min(history.length, 40) };
+}
+
+export async function pullAll() {
+  await freshSession();
+  const [remoteSettings, remotePresets, remoteModels, remoteRuns] = await Promise.all([
+    rest('GET', 'ga_settings', { query: '?select=data' }),
+    rest('GET', 'ga_presets', { query: '?select=id,data,updated_at' }),
+    rest('GET', 'ga_models', { query: '?select=id,data' }),
+    rest('GET', 'ga_runs', { query: '?select=id,data&order=created_at.desc&limit=60' }),
+  ]);
+
+  if (remoteSettings?.[0]?.data) await store.saveSettings(remoteSettings[0].data);
+
+  // Presets: newest wins per id.
+  const localPresets = await store.getPresets();
+  const byId = new Map(localPresets.map((p) => [p.id, p]));
+  for (const row of remotePresets || []) {
+    const local = byId.get(row.id);
+    if (!local || (row.data.updatedAt || 0) > (local.updatedAt || 0)) byId.set(row.id, row.data);
+  }
+  await store.replacePresets([...byId.values()]);
+
+  // Models: take remote config but keep the local api key.
+  const localModels = await store.getModels();
+  const mById = new Map(localModels.map((m) => [m.id, m]));
+  for (const row of remoteModels || []) {
+    const local = mById.get(row.id);
+    mById.set(row.id, { ...row.data, apiKey: local?.apiKey || '' });
+  }
+  await store.replaceModels([...mById.values()]);
+
+  // History: union.
+  const localRuns = await store.getHistory();
+  const rById = new Map(localRuns.map((h) => [h.id, h]));
+  for (const row of remoteRuns || []) if (!rById.has(row.id)) rById.set(row.id, row.data);
+  await store.replaceHistory([...rById.values()].sort((a, b) => b.ts - a.ts));
+
+  return {
+    presets: remotePresets?.length || 0,
+    models: remoteModels?.length || 0,
+    runs: remoteRuns?.length || 0,
+  };
+}

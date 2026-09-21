@@ -1,0 +1,20 @@
+// The agent itself runs inside the side panel (see lib/agent.js) so it can't be
+// killed by service-worker idle timeouts. This worker only wires up the toolbar
+// button and forwards the stop hotkey to the panel.
+
+function enablePanelOnClick() {
+  chrome.sidePanel
+    .setPanelBehavior({ openPanelOnActionClick: true })
+    .catch((err) => console.warn('sidePanel behavior failed', err));
+}
+
+chrome.runtime.onInstalled.addListener(enablePanelOnClick);
+chrome.runtime.onStartup.addListener(enablePanelOnClick);
+enablePanelOnClick();
+
+chrome.commands.onCommand.addListener((command) => {
+  if (command === 'stop-agent') {
+    // Panel listens for this; if it's closed there's nothing running to stop.
+    chrome.runtime.sendMessage({ type: 'agent:stop-hotkey' }).catch(() => {});
+  }
+});
