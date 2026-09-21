@@ -1,0 +1,129 @@
+{
+  "name": "GameProfile",
+  "type": "object",
+  "title": "Game Profile",
+  "properties": {
+    "name": {
+      "type": "string",
+      "title": "Profile Name"
+    },
+    "url": {
+      "type": "string",
+      "title": "Target URL",
+      "format": "uri"
+    },
+    "context_type": {
+      "type": "string",
+      "title": "Context",
+      "enum": [
+        "game",
+        "education",
+        "quiz",
+        "webapp",
+        "other"
+      ],
+      "default": "game"
+    },
+    "genre": {
+      "type": "string",
+      "title": "Genre / Subtype",
+      "default": ""
+    },
+    "tracked_variables": {
+      "type": "array",
+      "title": "Tracked Variables",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "selector": {
+            "type": "string"
+          },
+          "importance": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "category": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        }
+      },
+      "default": []
+    },
+    "cheats": {
+      "type": "array",
+      "title": "Saved Cheats",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "injection_type": {
+            "type": "string",
+            "enum": [
+              "script",
+              "value",
+              "click",
+              "key"
+            ]
+          },
+          "code": {
+            "type": "string"
+          },
+          "risk": {
+            "type": "string",
+            "enum": [
+              "safe",
+              "moderate",
+              "risky"
+            ]
+          }
+        }
+      },
+      "default": []
+    },
+    "last_summary": {
+      "type": "string",
+      "title": "Last Session Summary",
+      "default": ""
+    },
+    "site_info": {
+      "type": "object",
+      "title": "Site Info",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "allows_framing": {
+          "type": "boolean"
+        },
+        "technologies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "default": {}
+    }
+  },
+  "required": [
+    "name",
+    "url",
+    "context_type"
+  ]
+}
